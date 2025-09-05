@@ -6,66 +6,79 @@ from collections import deque
 from scipy.signal import butter, filtfilt, welch, coherence as sig_coherence
 from sklearn.decomposition import PCA
 import math
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 mp_face_mesh = mp.solutions.face_mesh
 
 # ========================== Configuration Parameters ==========================
 CONFIG = {
     # Image / timing
-    'process_width': 640,
-    'target_fs': 30.0,
-    'window_sec': 20.0,
-    'hop_sec': 0.5,
+    'process_width': 640,           # Width to resize frames for processing (pixels)
+    'target_fs': 30.0,              # Target sampling rate (frames per second)
+    'window_sec': 20.0,             # Signal window length for analysis (seconds)
+    'hop_sec': 0.5,                 # Time between HR analyses (seconds)
 
     # Spectral band (Hz) for heart rate
-    'bandpass_range': [0.7, 3.0],
-    'butter_order': 4,
-    'adaptive_filtering': True,
+    'bandpass_range': [0.7, 2.0],   # Frequency range for heart rate (Hz) [~42-120 bpm]
+    'butter_order': 4,              # Order of Butterworth bandpass filter
+    'adaptive_filtering': True,     # Use adaptive bandpass filter centered on previous HR
 
     # Acceptance gates / smoothing
-    'snr_db_min': 6.0,
-    'quality_min': 60.0,
-    'quality_smoothing_alpha': 0.1,
-    'low_signal_grace_hops': 3,
-    'clamp_bpm': 2.5,
-    'roc_max': 6.0,
+    'snr_db_min': 6.0,              # Minimum SNR (dB) to accept a heart rate estimate
+    'quality_min': 60.0,            # Minimum quality score to accept a heart rate estimate
+    'quality_smoothing_alpha': 0.1, # Smoothing factor for quality exponential moving average
+    'low_signal_grace_hops': 3,     # Allowed consecutive low-quality updates before hiding HR
+    'clamp_bpm': 2.5,               # Maximum allowed change in displayed BPM per update
+    'roc_max': 6.0,                 # Maximum rate of change for BPM (beats per minute per second)
 
     # ROI requirements
-    'min_roi_pixels': 2000,
+    'min_roi_pixels': 2000,         # Minimum number of pixels in ROI for valid measurement
 
     # Landmark smoothing (prevents ROI jitter without resizing the frame)
-    'landmark_smooth_alpha': 0.4,  # 0..1 (higher = faster follow, lower = smoother)
+    'landmark_smooth_alpha': 0.2,   # Smoothing factor for landmark positions (0..1, higher=faster)
 
     # Cheeks
-    'use_multiple_rois': True,
-    'cheek_circle_frac': 0.15,
-    'cheek_min_px_frac': 0.35,
-    'cheek_color': (0, 255, 0),
-    'cheek_thickness': 1,
-    'cheek_inward_frac': 0.05,
+    'use_multiple_rois': True,      # Use cheeks in addition to forehead for HR estimation
+    'cheek_circle_frac': 0.2,       # Cheek ROI size as a fraction of eye distance
+    'cheek_min_px_frac': 0.35,      # Minimum fraction of min_roi_pixels for cheeks
+    'cheek_color': (0, 255, 0),     # Color for cheek ROI circles (BGR)
+    'cheek_thickness': 1,           # Thickness of cheek ROI circle outline
+    'cheek_inward_frac': 0.25,      # Cheek ROI inward offset as a fraction of eye distance
 
     # Forehead shape adjustments
-    'forehead_shrink_px_big': 15,
-    'forehead_pad_frac': 0.06,
+    'forehead_shrink_px_big': 15,   # Shrink forehead ROI by this many pixels (at full scale)
+    'forehead_pad_frac': 0.06,      # Padding above eyes for forehead ROI (fraction of eye distance)
 
     # Motion / lighting artifact gates
-    'motion_norm_thresh': 0.045,
-    'illum_jump_thresh': 0.06,
+    'motion_norm_thresh': 0.045,    # Threshold for normalized motion penalty
+    'illum_jump_thresh': 0.06,      # Threshold for illumination change penalty
 
     # Coherence gating
-    'coherence_min': 0.30,
+    'coherence_min': 0.30,          # Minimum coherence between signals for acceptance
 
     # Measurement session
-    'measurement_sec': 60,
-    'min_accepted_points': 10,
+    'measurement_sec': 60,          # Duration of measurement session (seconds)
+    'min_accepted_points': 10,      # Minimum number of accepted HR points for final result
 
     # Head-turn gate
-    'yaw_gate_frac': 0.28
+    'yaw_gate_frac': 0.28           # Maximum allowed yaw (head turn) fraction
 }
 
 # ========================== Helpers: geometry & masks ==========================
 
 def unique_indices_from_connections(conns):
+    """
+    Extracts unique landmark indices from a list of connections.
+
+    Args:
+        conns (list or tuple): List of tuples representing landmark connections.
+
+    Returns:
+        list: Sorted list of unique landmark indices.
+    """
     # robust to tuples/Lists of tuples
     idxs = set()
     for c in conns:
@@ -75,9 +88,16 @@ def unique_indices_from_connections(conns):
 
 def as_xy(landmarks, w, h, indices):
     """
-    Accepts either:
-      - mediapipe landmark object with .landmark
-      - numpy array of shape (468, 2) with pixel coords
+    Converts landmark indices to (x, y) pixel coordinates.
+
+    Args:
+        landmarks: Mediapipe landmark object or ndarray of shape (468, 2).
+        w (int): Image width.
+        h (int): Image height.
+        indices (list): List of landmark indices.
+
+    Returns:
+        np.ndarray: Array of (x, y) pixel coordinates.
     """
     if hasattr(landmarks, 'landmark'):
         return np.array([(int(landmarks.landmark[i].x * w),
@@ -87,11 +107,32 @@ def as_xy(landmarks, w, h, indices):
         return landmarks[np.array(indices, dtype=int)].astype(np.int32)
 
 def all_landmarks_xy(landmarks, w, h):
-    """Return (468,2) array of pixel coords from mediapipe landmarks."""
+    """
+    Returns all 468 facial landmarks as (x, y) pixel coordinates.
+
+    Args:
+        landmarks: Mediapipe landmark object.
+        w (int): Image width.
+        h (int): Image height.
+
+    Returns:
+        np.ndarray: Array of shape (468, 2) with pixel coordinates.
+    """
     return np.array([(landmarks.landmark[i].x * w,
                       landmarks.landmark[i].y * h) for i in range(468)], dtype=np.float32)
 
 def poly_mask(h, w, polygon_pts):
+    """
+    Creates a binary mask from a polygon.
+
+    Args:
+        h (int): Image height.
+        w (int): Image width.
+        polygon_pts (np.ndarray): Polygon points.
+
+    Returns:
+        np.ndarray: Binary mask of the polygon.
+    """
     m = np.zeros((h, w), dtype=np.uint8)
     if polygon_pts is not None and len(polygon_pts) >= 3:
         cv2.fillPoly(m, [polygon_pts.astype(np.int32)], 255)
@@ -360,6 +401,28 @@ def band_coherence(x, y, fs, fmin, fmax):
     return float(np.nanmean(Cxy[band]))
 
 # ================================ Main =========================================
+
+def plot_signal_overlay(signal, width=320, height=80):
+    """
+    Plots the given signal and returns an image suitable for overlay on a video frame.
+    The plot background is transparent.
+    """
+    fig, ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
+    fig.patch.set_alpha(0.0)
+    ax.patch.set_alpha(0.0)
+    ax.plot(signal, color='blue')
+    ax.set_axis_off()
+    plt.tight_layout(pad=0)
+    buf = BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+    img_arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+    img = cv2.imdecode(img_arr, cv2.IMREAD_UNCHANGED)  # Read with alpha channel
+    # Convert to BGRA if not already
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -780,6 +843,23 @@ def main():
                     cv2.imshow("rPPG (1-min Result)", draw_img)
                     cv2.waitKey(5500)
                     break
+
+                if last_fused is not None and len(last_fused) > 32:
+                    # Take the last N samples for plotting
+                    plot_len = min(300, len(last_fused))
+                    sig_plot = last_fused[-plot_len:]
+                    plot_img = plot_signal_overlay(sig_plot, width=320, height=80)
+                    # Overlay the plot in the lower left corner with transparency
+                    ph, pw = plot_img.shape[0], plot_img.shape[1]
+                    if draw_img.shape[2] == 3:
+                        draw_img_bgra = cv2.cvtColor(draw_img, cv2.COLOR_BGR2BGRA)
+                    else:
+                        draw_img_bgra = draw_img.copy()
+                    roi = draw_img_bgra[-ph:, :pw]
+                    alpha_plot = plot_img[:, :, 3:4] / 255.0
+                    alpha_bg = 1.0 - alpha_plot
+                    roi[:, :, :3] = (alpha_plot * plot_img[:, :, :3] + alpha_bg * roi[:, :, :3]).astype(np.uint8)
+                    draw_img = cv2.cvtColor(draw_img_bgra, cv2.COLOR_BGRA2BGR)
 
                 cv2.imshow("rPPG (1-min Measurement)", draw_img)
 
